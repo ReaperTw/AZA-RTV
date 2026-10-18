@@ -2,12 +2,10 @@
 // @name         Read The Videos - YouTube to Gemini
 // @namespace    https://github.com/ReaperTw/AZA-RTV
 // @author       AzazelTw_
-// @version      0.5.6
+// @version      0.5.9
 // @description  Semi-automatic YouTube triage and Obsidian note prompts for Gemini. Sending is always manual.
 // @match        https://www.youtube.com/*
 // @match        https://gemini.google.com/*
-// @grant        GM_setValue
-// @grant        GM_getValue
 // @grant        GM_openInTab
 // @grant        GM_setClipboard
 // @updateURL    https://raw.githubusercontent.com/ReaperTw/AZA-RTV/main/read-the-videos.user.js
@@ -61,12 +59,20 @@
     const encoded = new URLSearchParams(location.hash.slice(1)).get('rtv');
     const fromUrl = encoded ? decodeJob(encoded) : null;
     if (fromUrl) {
-      GM_setValue(JOB_KEY, fromUrl);
+      try {
+        sessionStorage.setItem(JOB_KEY, JSON.stringify(fromUrl));
+      } catch (_) {
+        // 儲存區不可用時，本頁仍使用網址任務；重新整理後需從 YouTube 重開。
+      }
       if (consumeHash) history.replaceState(history.state, '', `${location.pathname}${location.search}`);
       return { job: fromUrl, source: '網址' };
     }
-    const stored = GM_getValue(JOB_KEY, null);
-    return { job: isValidJob(stored) ? stored : null, source: 'Tampermonkey 儲存區' };
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(JOB_KEY) || 'null');
+      return { job: isValidJob(stored) ? stored : null, source: '本分頁暫存' };
+    } catch (_) {
+      return { job: null, source: '本分頁暫存不可用' };
+    }
   }
 
   async function copyText(text) {
@@ -132,12 +138,14 @@
 
   const VAULT_NOTE = `這篇會原樣貼進 Obsidian。貼完不再有這段對話，不開影片也要能用。筆記裡不寫「如前所述」「本對話」「前一階段」。`;
 
-  const CONTINUE_LINE = `未完則末行寫「【未完待續：下一段請從時間戳 」加上一個已寫章節的字幕時間，再寫「 開始】」。`;
+  const CONTINUE_LINE = `未完則在區塊末行寫「【未完待續：章節時間＝…；最後已完成內容＝…；接續位置＝…】」，填入目前章節的字幕時間、最後完成的一句或要點，以及章內尚未完成的部分；若該章已完成，接續位置寫下一章。`;
 
   const TIMELINESS = `timeliness 用前一階段第 4 點；沒有就依字幕判：${TIMELINESS_OPTIONS}。寫進 YAML 的是四選一，不是這句說明。`;
 
+  const TRANSCRIPT_REQUIRED = `完整字幕是必要前提，不是只憑網址或標題推定已讀。若字幕只有部分、無法取得，或無法確認涵蓋片頭到片尾，停止產生或續寫課堂筆記，只回報已取得範圍、缺漏與需要使用者補上的字幕。不得用常識、標題或推測補齊。此停止規則優先於下方的筆記格式與 code block 要求。`;
+
   function transcriptContract(job) {
-    return `沿用本對話已讀字幕（${job.url}／${job.title}）。缺完整字幕就先重讀。繁中，直接出筆記。`;
+    return `先確認本對話已有這支影片的完整字幕（${job.url}／${job.title}），不得沿用其他影片的字幕。繁中。${TRANSCRIPT_REQUIRED}`;
   }
 
   function analysisPrompt(job) {
@@ -146,6 +154,7 @@ ${job.url}
 標題：${job.title}
 
 讀完整字幕，片頭到片尾。繁中，只交下面 10 項，用來決定要不要存進 Obsidian：
+字幕不完整或無法確認全片涵蓋時，只填可查證的內容，未知項寫無法判定；第 9 項改寫「暫停：需補完整字幕」，不得建議直接深入整理。
 1. 字幕：完整／部分／無法取得
 2. 涵蓋起訖；無法取得就寫無法取得
 3. 一句主旨
@@ -188,8 +197,9 @@ ${ENVELOPE}`;
   }
 
   function continueNotePrompt(job) {
-    return `繼續同一份課堂紀錄。沿用本對話字幕（${job.url}／${job.title}）。繁中。
-新章節接到上一份筆記後面。從上一則「【未完待續」裡的時間接著寫，只寫該時間之後的新章節。沒有該標記，就從上一則最後一個章節時間接著寫。格式、用語、字幕依據與上一則相同。
+    return `繼續同一份課堂紀錄。${transcriptContract(job)}
+接在上一份筆記後面，先補完最後一個未完成的句子、清單、程式碼或章節，再繼續後面的章節；不要因為章節時間已出現就跳過該章剩餘內容，也不要重複已完成段落。
+依上一則「【未完待續」的章節時間、最後已完成內容與接續位置定位。若是舊版只有時間的標記，或沒有標記，就對照上一則最後實際寫到的內容與字幕，從中斷處接續，不直接跳到下一章。無法定位就先請使用者補上上一份筆記末段，不猜測。格式、用語與字幕依據沿用上一則。
 到片尾才寫 ## 結論與可執行項目。
 若上一則已到片尾、只是沒進 code block，把完整筆記原樣包進區塊。
 ${CONTINUE_LINE}
@@ -225,21 +235,27 @@ ${ENVELOPE}`;
     button.addEventListener('click', async () => {
       if (button.disabled) return;
       button.disabled = true;
-      const job = {
-        url: cleanYouTubeUrl(),
-        title: document.querySelector('h1 yt-formatted-string')?.textContent?.trim()
-          || document.title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, ''),
-        createdAt: new Date().toISOString()
-      };
-      GM_setValue(JOB_KEY, job);
-      const prompt = analysisPrompt(job);
-      await copyText(prompt);
-      button.textContent = 'Prompt 已複製';
-      GM_openInTab(`${GEMINI_URL}#rtv=${encodeJob(job)}`, { active: true, insert: true });
-      setTimeout(() => {
-        button.disabled = false;
-        button.textContent = '用 Gemini 分析';
-      }, 1500);
+      button.title = '';
+      try {
+        const job = {
+          url: cleanYouTubeUrl(),
+          title: document.querySelector('h1 yt-formatted-string')?.textContent?.trim()
+            || document.title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, ''),
+          createdAt: new Date().toISOString()
+        };
+        const prompt = analysisPrompt(job);
+        await copyText(prompt);
+        GM_openInTab(`${GEMINI_URL}#rtv=${encodeJob(job)}`, { active: true, insert: true });
+        button.textContent = 'Prompt 已複製';
+      } catch (error) {
+        button.textContent = '操作失敗，請重試';
+        button.title = error.message || String(error);
+      } finally {
+        setTimeout(() => {
+          button.disabled = false;
+          button.textContent = '用 Gemini 分析';
+        }, 1500);
+      }
     });
     target.prepend(button);
   }
@@ -268,6 +284,10 @@ ${ENVELOPE}`;
     return (editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText || editor.textContent || '').trim();
   }
 
+  function normalizeLines(s) {
+    return String(s || '').replace(/\r\n?/g, '\n').replace(/[\u2028\u2029]/g, '\n').trim();
+  }
+
   function insertPrompt(text) {
     const editor = findComposer();
     if (!editor) throw new Error('找不到 Gemini 輸入框');
@@ -282,7 +302,8 @@ ${ENVELOPE}`;
       document.execCommand('insertText', false, text);
     }
 
-    if (!composerText(editor)) throw new Error('瀏覽器拒絕自動輸入；Prompt 已複製，請按 Ctrl+V');
+    const inserted = composerText(editor);
+    if (normalizeLines(inserted) !== normalizeLines(text)) throw new Error('瀏覽器拒絕自動輸入；Prompt 已複製，請按 Ctrl+V');
   }
 
   function createElement(tag, text, styles = {}) {
@@ -298,9 +319,9 @@ ${ENVELOPE}`;
     const panel = createElement('aside');
     panel.id = 'rtv-panel';
     Object.assign(panel.style, {
-      position: 'fixed', right: '100px', bottom: '30px', zIndex: '2147483647',
+      position: 'fixed', right: 'clamp(12px, calc(100vw - 290px), 100px)', bottom: '30px', zIndex: '2147483647',
       display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px',
-      width: 'auto', height: 'auto', padding: '0', background: 'transparent',
+      width: 'auto', maxWidth: 'calc(100vw - 24px)', height: 'auto', padding: '0', background: 'transparent',
       color: '#fff', fontFamily: 'system-ui, sans-serif'
     });
 
@@ -316,10 +337,9 @@ ${ENVELOPE}`;
 
     const menu = createElement('div');
     menu.id = 'rtv-menu';
-    menu.setAttribute('role', 'menu');
     Object.assign(menu.style, {
       display: 'none', flexDirection: 'column', alignItems: 'stretch', gap: '8px',
-      width: '250px', maxHeight: '70vh', overflowY: 'auto', padding: '14px',
+      boxSizing: 'border-box', width: '278px', maxWidth: '100%', maxHeight: '70vh', overflowY: 'auto', padding: '14px',
       borderRadius: '14px', background: 'rgba(32, 33, 36, .97)',
       boxShadow: '0 8px 24px rgba(0,0,0,.45)'
     });
@@ -329,11 +349,14 @@ ${ENVELOPE}`;
       opacity: '.78', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
     });
     jobTitle.id = 'rtv-job-title';
+    const contextNotice = createElement('small', '深入整理與續寫前，會請你確認本對話已有這支影片的完整字幕。', {
+      fontSize: '12px', lineHeight: '1.4', color: '#bfdbfe'
+    });
 
     const actions = [
-      ['analysis', '① 重新貼上字幕審查'],
-      ['detailed', '② 產生深入課堂紀錄'],
-      ['continue', '③ 繼續未完成筆記']
+      ['analysis', '① 貼上字幕審查指令'],
+      ['detailed', '② 貼上深入筆記指令'],
+      ['continue', '③ 貼上續寫指令']
     ];
     const buttons = actions.map(([action, label], index) => {
       const button = createElement('button', label, {
@@ -343,7 +366,6 @@ ${ENVELOPE}`;
       });
       button.type = 'button';
       button.dataset.action = action;
-      button.setAttribute('role', 'menuitem');
       return button;
     });
 
@@ -352,11 +374,12 @@ ${ENVELOPE}`;
     });
     statusNode.id = 'rtv-status';
 
-    menu.append(heading, jobTitle, ...buttons, statusNode);
+    menu.append(heading, jobTitle, contextNotice, ...buttons, statusNode);
     panel.append(menu, fab);
     document.body.appendChild(panel);
 
     let menuOpen = false;
+    let openedByKeyboard = false;
     const setMenuOpen = (open) => {
       menuOpen = open;
       menu.style.display = open ? 'flex' : 'none';
@@ -364,8 +387,13 @@ ${ENVELOPE}`;
       fab.title = open ? '收合 Read The Videos' : '開啟 Read The Videos';
       fab.setAttribute('aria-expanded', String(open));
     };
-    fab.addEventListener('click', () => setMenuOpen(!menuOpen));
-
+    fab.addEventListener('mousedown', () => { openedByKeyboard = false; });
+    fab.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') openedByKeyboard = true; });
+    fab.addEventListener('click', () => {
+      const wasOpen = menuOpen;
+      setMenuOpen(!menuOpen);
+      if (!wasOpen && openedByKeyboard) { buttons[0]?.focus(); openedByKeyboard = false; }
+    });
     const loaded = loadCurrentJob(true);
     const job = loaded.job;
     jobTitle.textContent = job?.title || '找不到 YouTube 工作項目';
@@ -383,15 +411,19 @@ ${ENVELOPE}`;
       if (!button || button.disabled) return;
       button.disabled = true;
       try {
-        const current = loadCurrentJob().job;
-        if (!current) throw new Error('請先從 YouTube 建立工作項目');
+        if (!job) throw new Error('請先從 YouTube 為此分頁建立工作項目');
+        const conversationPath = location.pathname;
+        if (button.dataset.action !== 'analysis' && !window.confirm(
+          `目前影片：${job.title}\n${job.url}\n\n請確認：你已在「目前這個對話」完成這支影片的字幕審查，結果為完整且涵蓋全片。\n\n若尚未審查、字幕不完整，或已切換到其他對話，請取消，先執行字幕審查或補齊字幕。\n\n確定繼續？`
+        )) return;
         const prompts = {
           analysis: analysisPrompt,
           detailed: detailedNotePrompt,
           continue: continueNotePrompt
         };
-        const prompt = prompts[button.dataset.action](current);
+        const prompt = prompts[button.dataset.action](job);
         await copyText(prompt);
+        if (location.pathname !== conversationPath) throw new Error('對話已切換，未貼上；請在目前對話重新確認字幕');
         insertPrompt(prompt);
         setStatus('已貼上；請檢查後手動送出');
       } catch (error) {
@@ -400,15 +432,23 @@ ${ENVELOPE}`;
         button.disabled = false;
       }
     });
+    panel.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menuOpen) { setMenuOpen(false); fab.focus(); }
+    });
 
     // 只在從 YouTube 新開的 Gemini 頁面自動填入第一段；永遠不會自動送出。
     if (job && loaded.source === '網址' && !autoInsertStarted) {
       autoInsertStarted = true;
       (async () => {
         const prompt = analysisPrompt(job);
+        const conversationPath = location.pathname;
         await copyText(prompt);
         for (let attempt = 0; attempt < AUTO_INSERT_ATTEMPTS; attempt += 1) {
           await sleep(AUTO_INSERT_INTERVAL_MS);
+          if (location.pathname !== conversationPath) {
+            setStatus('對話已切換，已停止自動填入；請在需要的對話重新貼上字幕審查');
+            return;
+          }
           const editor = findComposer();
           if (!editor) continue;
           if (composerText(editor)) {
