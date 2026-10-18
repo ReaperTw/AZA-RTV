@@ -2,7 +2,7 @@
 // @name         Read The Videos - YouTube to Gemini
 // @namespace    https://github.com/ReaperTw/AZA-RTV
 // @author       AzazelTw_
-// @version      0.5.9
+// @version      0.5.10
 // @description  Semi-automatic YouTube triage and Obsidian note prompts for Gemini. Sending is always manual.
 // @match        https://www.youtube.com/*
 // @match        https://gemini.google.com/*
@@ -124,7 +124,7 @@
 
   const VALUE_FILTER = `留機制（條件、步驟、阻力解法、下一步）；口號留一句；無方法的鼓舞（空泛雞湯）不寫。認知重塑（舊認知→新框架→論證、案例、反例、邊界）算機制。`;
 
-  const GROUNDING = `依據字幕。事實、主張、留言分開寫。時間戳與數據只寫字幕裡有的。產品以字幕可觀察為準。「最新」寫成講者主張。`;
+  const GROUNDING = `依據字幕。事實、主張分開寫。時間戳與數據只寫字幕裡有的。產品以字幕可觀察為準。「最新」寫成講者主張。`;
 
   const NOTE_GROUNDING = `${GROUNDING} 公式用 $...$ 或 $$...$$，留分子、分母與條件。譯名用公認繁中，沒有公認譯名就留英文。引言歸屬不明寫「影片引用」。`;
 
@@ -153,8 +153,8 @@
 ${job.url}
 標題：${job.title}
 
-讀完整字幕，片頭到片尾。繁中，只交下面 10 項，用來決定要不要存進 Obsidian：
-字幕不完整或無法確認全片涵蓋時，只填可查證的內容，未知項寫無法判定；第 9 項改寫「暫停：需補完整字幕」，不得建議直接深入整理。
+讀完整字幕，片頭到片尾。繁中，只交下面 9 項，用來決定要不要存進 Obsidian：
+字幕不完整或無法確認全片涵蓋時，只填可查證的內容，未知項寫無法判定；第 8 項改寫「暫停：需補完整字幕」，不得建議直接深入整理。
 1. 字幕：完整／部分／無法取得
 2. 涵蓋起訖；無法取得就寫無法取得
 3. 一句主旨
@@ -162,9 +162,8 @@ ${job.url}
 5. 具體新知、證據、案例或可執行方法；沒有就寫無
 6. 性質：知識傳遞／認知重塑／空泛雞湯／宣傳／混合 + 一句依據
 7. 文字無法承載、必須回看畫面的時間點；沒有就寫無
-8. 留言區勘誤或補充（未驗證）；讀不到就寫無法取得
-9. 建議：淘汰／深入整理
-10. 理由，最多三點
+8. 建議：淘汰／深入整理
+9. 理由，最多三點
 
 ${VALUE_FILTER}
 ${GROUNDING}`;
@@ -188,8 +187,6 @@ ${TIMELINESS}
 4. ## 課堂內容（影片原序）
    ${HEADING} ${WIKILINK}
 5. ## 結論與可執行項目
-
-留言只寫「留言區補充（未驗證）」。
 ${CONTINUE_LINE}
 ${CALLOUTS}
 ${NOTE_GROUNDING}
