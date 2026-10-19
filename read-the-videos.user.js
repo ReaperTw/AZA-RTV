@@ -2,7 +2,7 @@
 // @name         Read The Videos - YouTube to Gemini
 // @namespace    https://github.com/ReaperTw/AZA-RTV
 // @author       AzazelTw_
-// @version      0.5.10
+// @version      0.5.12
 // @description  Semi-automatic YouTube triage and Obsidian note prompts for Gemini. Sending is always manual.
 // @match        https://www.youtube.com/*
 // @match        https://gemini.google.com/*
@@ -18,13 +18,45 @@
 
   const GEMINI_URL = 'https://gemini.google.com/u/2/app?hl=zh-TW';
   const JOB_KEY = 'rtv-current-job';
+  const CONV_KEY = 'rtv-conv-assoc';
   const STYLE_ID = 'rtv-style';
   const AUTO_INSERT_ATTEMPTS = 60;
   const AUTO_INSERT_INTERVAL_MS = 500;
   let autoInsertStarted = false;
+  let deliverySeq = 0;
+  let pendingAutoToken = null;
+  let latchedConversation = null;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  function loadAssociatedConv() {
+    try { return sessionStorage.getItem(CONV_KEY) || null; } catch (_) { return null; }
+  }
+
+  function beginDelivery() {
+    const token = { id: ++deliverySeq, cancelled: false, path: null };
+    return token;
+  }
+
+  function cancelPendingAuto() {
+    if (pendingAutoToken) {
+      pendingAutoToken.cancelled = true;
+      pendingAutoToken = null;
+    }
+  }
+
+
+  function isSameConversation(a, b) {
+    if (a === b) return true;
+    const base = '/u/2/app';
+    if (!latchedConversation && b === base && a && a.startsWith(base + '/')) {
+      latchedConversation = a;
+      try { sessionStorage.setItem(CONV_KEY, a); } catch (_) {}
+      return true;
+    }
+    if (latchedConversation && a === latchedConversation) return true;
+    return false;
+  }
   function isValidJob(job) {
     return Boolean(
       job
@@ -106,10 +138,16 @@
       }
       .rtv-button:hover { filter: brightness(1.1); }
       .rtv-button:disabled { cursor: wait; opacity: .7; }
-      #rtv-youtube-button {
-        margin: 0 8px 0 0; height: 40px; min-width: max-content;
-        flex: 0 0 auto; align-self: center;
+      #rtv-youtube-wrap {
+        position: relative; display: inline-flex; flex: 0 0 auto; align-self: center;
+        margin: 0 8px 0 0;
       }
+      #rtv-youtube-button { margin: 0; height: 40px; min-width: max-content; }
+      #rtv-youtube-menu {
+        position: absolute; top: 44px; left: 0; z-index: 20;
+        flex-direction: column; gap: 4px; min-width: 100%;
+      }
+      #rtv-youtube-menu .rtv-button { height: 36px; width: 100%; }
     `;
     document.head.appendChild(style);
   }
@@ -169,9 +207,8 @@ ${VALUE_FILTER}
 ${GROUNDING}`;
   }
 
-  function detailedNotePrompt(job) {
-    return `課堂紀錄。${transcriptContract(job)}
-${VAULT_NOTE}
+  function noteInstructions(job) {
+    return `${VAULT_NOTE}
 依講者順序留下解釋、推理、案例、比喻、步驟與結論。有實質的字幕段全覆蓋。筆記用技術書面繁中。口頭禪不入筆記。工商、寒暄、片頭片尾不寫。賣課只留脫離課程仍成立的知識。
 ${TIMELINESS}
 
@@ -191,6 +228,32 @@ ${CONTINUE_LINE}
 ${CALLOUTS}
 ${NOTE_GROUNDING}
 ${ENVELOPE}`;
+  }
+
+  function detailedNotePrompt(job) {
+    return `課堂紀錄。${transcriptContract(job)}
+${noteInstructions(job)}`;
+  }
+
+  function openingNotePrompt(job) {
+    return `課堂紀錄。讀這支影片的完整字幕，片頭到片尾（${job.url}／${job.title}），不得沿用其他影片的字幕。繁中。${TRANSCRIPT_REQUIRED}
+${noteInstructions(job)}`;
+  }
+
+  function jobMode(job) {
+    return job?.mode === 'note' ? 'note' : 'triage';
+  }
+
+  function openingPrompt(job) {
+    return jobMode(job) === 'note' ? openingNotePrompt(job) : analysisPrompt(job);
+  }
+
+  function confirmFor(job, action) {
+    const head = `目前影片：${job.title}\n${job.url}\n\n`;
+    if (jobMode(job) === 'note' && action === 'continue') {
+      return `${head}請確認：目前這個對話就是這支影片的筆記，且你要從中斷處續寫。\n\n若已切換到其他對話，請取消。\n\n確定繼續？`;
+    }
+    return `${head}請確認：你已在「目前這個對話」完成這支影片的字幕審查，結果為完整且涵蓋全片。\n\n若尚未審查、字幕不完整，或已切換到其他對話，請取消，先執行字幕審查或補齊字幕。\n\n確定繼續？`;
   }
 
   function continueNotePrompt(job) {
@@ -217,44 +280,90 @@ ${ENVELOPE}`;
       || [...document.querySelectorAll('#actions-inner')].find(isVisible);
     if (!target) return;
 
-    const existing = document.getElementById('rtv-youtube-button');
+    const existing = document.getElementById('rtv-youtube-wrap');
     if (existing) {
-      // 播放清單或 SPA 導航可能重建操作列；將既有按鈕搬到目前可見的容器。
+      // 播放清單或 SPA 導航可能重建操作列；將既有選單搬到目前可見的容器。
       if (existing.parentElement !== target) target.prepend(existing);
       return;
     }
 
+    const wrap = document.createElement('span');
+    wrap.id = 'rtv-youtube-wrap';
     const button = document.createElement('button');
     button.id = 'rtv-youtube-button';
     button.className = 'rtv-button';
     button.type = 'button';
     button.textContent = '用 Gemini 分析';
-    button.addEventListener('click', async () => {
-      if (button.disabled) return;
+    button.setAttribute('aria-expanded', 'false');
+    button.setAttribute('aria-controls', 'rtv-youtube-menu');
+    const menu = document.createElement('div');
+    menu.id = 'rtv-youtube-menu';
+    menu.style.display = 'none';
+
+    let menuOpen = false;
+    let openedByKeyboard = false;
+    let busy = false;
+    const setMenu = (open) => {
+      menuOpen = open;
+      menu.style.display = open ? 'flex' : 'none';
+      button.setAttribute('aria-expanded', String(open));
+    };
+    const send = async (mode) => {
+      if (busy) return;
+      busy = true;
       button.disabled = true;
       button.title = '';
+      setMenu(false);
       try {
         const job = {
           url: cleanYouTubeUrl(),
           title: document.querySelector('h1 yt-formatted-string')?.textContent?.trim()
             || document.title.replace(/^\(\d+\)\s*/, '').replace(/ - YouTube$/, ''),
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
+          mode
         };
-        const prompt = analysisPrompt(job);
-        await copyText(prompt);
+        await copyText(openingPrompt(job));
         GM_openInTab(`${GEMINI_URL}#rtv=${encodeJob(job)}`, { active: true, insert: true });
-        button.textContent = 'Prompt 已複製';
+        button.textContent = mode === 'note' ? '筆記已複製' : 'Prompt 已複製';
       } catch (error) {
         button.textContent = '操作失敗，請重試';
         button.title = error.message || String(error);
       } finally {
         setTimeout(() => {
+          busy = false;
           button.disabled = false;
           button.textContent = '用 Gemini 分析';
         }, 1500);
       }
+    };
+    const choices = [
+      ['triage', '查證'],
+      ['note', '整理']
+    ].map(([mode, label]) => {
+      const choice = document.createElement('button');
+      choice.type = 'button';
+      choice.className = 'rtv-button';
+      choice.dataset.mode = mode;
+      choice.textContent = label;
+      choice.addEventListener('click', () => send(mode));
+      return choice;
     });
-    target.prepend(button);
+    menu.append(...choices);
+    button.addEventListener('mousedown', () => { openedByKeyboard = false; });
+    button.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') openedByKeyboard = true;
+    });
+    button.addEventListener('click', () => {
+      if (busy || button.disabled) return;
+      const willOpen = !menuOpen;
+      setMenu(willOpen);
+      if (willOpen && openedByKeyboard) {
+        choices[0]?.focus?.();
+        openedByKeyboard = false;
+      }
+    });
+    wrap.append(button, menu);
+    target.prepend(wrap);
   }
 
   function findComposer() {
@@ -303,6 +412,7 @@ ${ENVELOPE}`;
     if (normalizeLines(inserted) !== normalizeLines(text)) throw new Error('瀏覽器拒絕自動輸入；Prompt 已複製，請按 Ctrl+V');
   }
 
+
   function createElement(tag, text, styles = {}) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
@@ -346,7 +456,7 @@ ${ENVELOPE}`;
       opacity: '.78', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
     });
     jobTitle.id = 'rtv-job-title';
-    const contextNotice = createElement('small', '深入整理與續寫前，會請你確認本對話已有這支影片的完整字幕。', {
+    const contextNotice = createElement('small', '', {
       fontSize: '12px', lineHeight: '1.4', color: '#bfdbfe'
     });
 
@@ -393,8 +503,13 @@ ${ENVELOPE}`;
     });
     const loaded = loadCurrentJob(true);
     const job = loaded.job;
+    latchedConversation = loadAssociatedConv() || latchedConversation;
     jobTitle.textContent = job?.title || '找不到 YouTube 工作項目';
-    jobTitle.title = `資料來源：${loaded.source}`;
+    jobTitle.title = `資料來源：${loaded.source}；${jobMode(job) === 'note' ? '整理' : '查證'}`;
+    contextNotice.textContent = jobMode(job) === 'note'
+      ? '這分頁是整理。再貼筆記會要求現在讀片並寫筆記，不會當成已經審查過。續寫前仍會請你確認本對話。'
+      : '深入整理與續寫前，會請你確認本對話已有這支影片的完整字幕。';
+    // entry mode only affects opening prompt and job title; panel actions are explicit (detailed always detailedNotePrompt)
 
     const setStatus = (message, error = false) => {
       statusNode.textContent = message;
@@ -403,28 +518,74 @@ ${ENVELOPE}`;
       fab.title = message;
     };
 
+
+    async function deliverPrompt(prompt, { token, isAuto = false, waitForComposer = false } = {}) {
+      if (!token || token.cancelled || deliverySeq !== token.id) return { outcome: 'cancelled' };
+      try {
+        const conversationPath = location.pathname;
+        await copyText(prompt);
+        if (!token || token.cancelled || deliverySeq !== token.id) return { outcome: 'cancelled' };
+        token.path = conversationPath;
+        if (waitForComposer ? !isSameConversation(location.pathname, conversationPath) : location.pathname !== conversationPath) {
+          throw new Error('對話已切換，未貼上；請在目前對話重新操作');
+        }
+        if (waitForComposer) {
+          for (let attempt = 0; attempt < AUTO_INSERT_ATTEMPTS; attempt += 1) {
+            await sleep(AUTO_INSERT_INTERVAL_MS);
+            if (!token || token.cancelled || deliverySeq !== token.id || !isSameConversation(location.pathname, conversationPath)) {
+              if (token && !token.cancelled && deliverySeq === token.id) {
+                setStatus(`對話已切換，已停止自動填入；請在需要的對話重新貼上${jobMode(job) === 'note' ? '開場筆記' : '字幕審查'}`);
+              }
+              return { outcome: 'nav' };
+            }
+            const editor = findComposer();
+            if (!editor) continue;
+            if (composerText(editor)) {
+              if (!token.cancelled && deliverySeq === token.id) setStatus('輸入框已有內容，未自動覆蓋');
+              return { outcome: 'draft' };
+            }
+            try {
+              insertPrompt(prompt);
+              if (!token || token.cancelled || deliverySeq !== token.id) return { outcome: 'cancelled' };
+              setStatus(jobMode(job) === 'note' ? '已自動填入課堂筆記；請手動送出' : '已自動填入字幕審查；請手動送出');
+              return { outcome: 'success' };
+            } catch (err) {
+              if (!token || token.cancelled || deliverySeq !== token.id) return { outcome: 'cancelled' };
+              setStatus((err && err.message) || '無法自動填入；Prompt 已複製，請按 Ctrl+V', true);
+              return { outcome: 'partial' };
+            }
+          }
+          if (!token.cancelled && deliverySeq === token.id) setStatus('無法自動填入；Prompt 已複製，請按 Ctrl+V', true);
+          return { outcome: 'timeout' };
+        } else {
+          insertPrompt(prompt);
+          if (!token || token.cancelled || deliverySeq !== token.id) return { outcome: 'cancelled' };
+          setStatus('已貼上；請檢查後手動送出');
+          return { outcome: 'success' };
+        }
+      } catch (error) {
+        if (token && !token.cancelled && deliverySeq === token.id) {
+          setStatus(error.message || String(error), true);
+        }
+        return { outcome: 'error', error };
+      }
+    }
     panel.addEventListener('click', async (event) => {
       const button = event.target.closest('button[data-action]');
       if (!button || button.disabled) return;
       button.disabled = true;
+      const delivery = beginDelivery();
+      cancelPendingAuto();
       try {
         if (!job) throw new Error('請先從 YouTube 為此分頁建立工作項目');
-        const conversationPath = location.pathname;
-        if (button.dataset.action !== 'analysis' && !window.confirm(
-          `目前影片：${job.title}\n${job.url}\n\n請確認：你已在「目前這個對話」完成這支影片的字幕審查，結果為完整且涵蓋全片。\n\n若尚未審查、字幕不完整，或已切換到其他對話，請取消，先執行字幕審查或補齊字幕。\n\n確定繼續？`
-        )) return;
+        if (button.dataset.action !== 'analysis' && !window.confirm(confirmFor(job, button.dataset.action))) return;
         const prompts = {
           analysis: analysisPrompt,
           detailed: detailedNotePrompt,
           continue: continueNotePrompt
         };
         const prompt = prompts[button.dataset.action](job);
-        await copyText(prompt);
-        if (location.pathname !== conversationPath) throw new Error('對話已切換，未貼上；請在目前對話重新確認字幕');
-        insertPrompt(prompt);
-        setStatus('已貼上；請檢查後手動送出');
-      } catch (error) {
-        setStatus(error.message || String(error), true);
+        await deliverPrompt(prompt, { token: delivery, isAuto: false });
       } finally {
         button.disabled = false;
       }
@@ -436,31 +597,15 @@ ${ENVELOPE}`;
     // 只在從 YouTube 新開的 Gemini 頁面自動填入第一段；永遠不會自動送出。
     if (job && loaded.source === '網址' && !autoInsertStarted) {
       autoInsertStarted = true;
+      const token = beginDelivery();
+      pendingAutoToken = token;
       (async () => {
-        const prompt = analysisPrompt(job);
-        const conversationPath = location.pathname;
-        await copyText(prompt);
-        for (let attempt = 0; attempt < AUTO_INSERT_ATTEMPTS; attempt += 1) {
-          await sleep(AUTO_INSERT_INTERVAL_MS);
-          if (location.pathname !== conversationPath) {
-            setStatus('對話已切換，已停止自動填入；請在需要的對話重新貼上字幕審查');
-            return;
-          }
-          const editor = findComposer();
-          if (!editor) continue;
-          if (composerText(editor)) {
-            setStatus('輸入框已有內容，未自動覆蓋');
-            return;
-          }
-          try {
-            insertPrompt(prompt);
-            setStatus('已自動填入字幕審查；請手動送出');
-            return;
-          } catch (_) {
-            // Gemini 可能仍在建立編輯器，繼續嘗試。
-          }
+        try {
+          const prompt = openingPrompt(job);
+          await deliverPrompt(prompt, { token, isAuto: true, waitForComposer: true });
+        } finally {
+          if (pendingAutoToken === token) pendingAutoToken = null;
         }
-        setStatus('無法自動填入；Prompt 已複製，請按 Ctrl+V', true);
       })();
     }
   }

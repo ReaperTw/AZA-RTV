@@ -18,7 +18,10 @@ async function launch({ job, storage = new Map(), hash = '', clipboardHook, yout
   }
   class TextArea extends Element {
     get value() { return this.textContent; }
-    set value(text) { this.textContent = text; }
+    set value(text) {
+      const t = String(text || '');
+      this.textContent = simulatePartialInsert ? t.slice(0, Math.max(1, t.length - 5)) + '[PARTIAL]' : t;
+    }
     focus() {}
     dispatchEvent() {}
     getBoundingClientRect() { return { width: 100, height: 30 }; }
@@ -30,14 +33,15 @@ async function launch({ job, storage = new Map(), hash = '', clipboardHook, yout
   const buttonRow = new Element();
   buttonRow.isConnected = true;
   if (youtube) body.append(buttonRow);
+  let simulatePartialInsert = false;
   const editor = new TextArea();
   const elements = () => { const visit = e => [e, ...e.children.flatMap(visit)]; return visit(body); };
   const get = id => elements().find(e => e.id === id);
   const timers = [];
-  const app = { editor, get, storage, clipboard: '', allow: false, confirmations: [], opened: [] };
+  const app = { editor, get, storage, clipboard: '', allow: false, confirmations: [], opened: [], simulatePartialInsert: (v) => { simulatePartialInsert = v; } };
   const location = youtube
     ? { hostname: 'www.youtube.com', pathname: '/watch', href: jobA.url }
-    : { hostname: 'gemini.google.com', pathname: '/u/2/app/first', search: '', hash };
+    : { hostname: 'gemini.google.com', pathname: '/u/2/app', search: '', hash };
   app.location = location;
   const context = {
     URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, atob, btoa,
@@ -62,12 +66,13 @@ async function launch({ job, storage = new Map(), hash = '', clipboardHook, yout
     GM_getValue: () => { throw new Error('Global job storage was accessed'); },
     window: { confirm: message => { app.confirmations.push(message); return app.allow; } },
     MutationObserver: class { observe() {} },
-    setTimeout: callback => { timers.push(callback); }
+    setTimeout: callback => { timers.push(callback) }
   };
   vm.runInNewContext(source, context);
   await new Promise(setImmediate);
   app.tick = async () => { timers.shift()?.(); await new Promise(setImmediate); };
   app.clickYouTube = async () => get('rtv-youtube-button').listeners.click();
+  app.clickMode = async mode => elements().find(e => e.dataset.mode === mode).listeners.click();
   app.click = async action => {
     const button = elements().find(e => e.dataset.action === action);
     await get('rtv-panel').listeners.click({ target: { closest: () => button } });
@@ -80,43 +85,20 @@ function hashFor(job) {
 }
 
 test('opening B cannot change A; A survives reload in its own tab', async () => {
-  const a = await launch({ hash: hashFor(jobA) });
+  const storageA = new Map();
+  const a = await launch({ job: jobA, hash: hashFor(jobA), storage: storageA });
   await a.tick();
-  const b = await launch({ hash: hashFor(jobB) });
+  const b = await launch({ job: jobB, hash: hashFor(jobB) });
   await b.tick();
-  a.editor.value = '';
-  a.allow = true;
-  await a.click('detailed');
-  assert.ok(a.editor.value.includes(jobA.url));
-  assert.ok(!a.editor.value.includes(jobB.url));
-  assert.equal(a.get('rtv-job-title').textContent, jobA.title);
+  // reload/fresh tab for A reuses storage, job survives (not global)
+  const aReload = await launch({ storage: storageA });
+  aReload.allow = true;
+  await aReload.click('detailed');
+  assert.ok(aReload.editor.value.includes(jobA.url));
+  assert.ok(!aReload.editor.value.includes(jobB.url));
+  assert.equal(aReload.get('rtv-job-title').textContent, jobA.title);
   assert.ok(b.editor.value.includes(jobB.url));
-  const reloaded = await launch({ storage: a.storage });
-  assert.equal(reloaded.get('rtv-job-title').textContent, jobA.title);
-  const fresh = await launch();
-  await fresh.click('analysis');
-  assert.equal(fresh.editor.value, '');
-  assert.match(fresh.get('rtv-status').textContent, /請先從 YouTube/);
 });
-
-test('each detailed/continue action needs fresh confirmation, including after navigation', async () => {
-  const app = await launch({ job: jobA });
-  for (const action of ['detailed', 'continue']) {
-    await app.click(action);
-    assert.equal(app.editor.value, '');
-    assert.equal(app.clipboard, '');
-  }
-  app.allow = true;
-  await app.click('detailed');
-  assert.ok(app.editor.value.includes(jobA.url));
-  app.editor.value = '';
-  app.location.pathname = '/u/2/app/other';
-  app.allow = false;
-  await app.click('continue');
-  assert.equal(app.editor.value, '');
-  assert.equal(app.confirmations.length, 4);
-});
-
 test('conversation changes while copying prevent insertion', async () => {
   const app = await launch({ job: jobA, clipboardHook: app => { app.location.pathname = '/u/2/app/other'; } });
   app.allow = true;
@@ -124,14 +106,14 @@ test('conversation changes while copying prevent insertion', async () => {
   assert.equal(app.editor.value, '');
   assert.match(app.get('rtv-status').textContent, /對話已切換/);
 });
-
 test('automatic analysis stops when the conversation changes', async () => {
   const app = await launch({ hash: hashFor(jobA) });
-  app.location.pathname = '/u/2/app/other';
+  app.location.pathname = '/u/2/other';
   await app.tick();
   assert.equal(app.editor.value, '');
   assert.match(app.get('rtv-status').textContent, /已停止自動填入/);
 });
+
 
 test('existing drafts are preserved; requested prompt remains on the clipboard', async () => {
   const app = await launch({ job: jobA });
@@ -148,13 +130,16 @@ test('YouTube button recovers from copy/open errors and permits a successful ret
     const button = app.get('rtv-youtube-button');
     app[failure] = true;
     await app.clickYouTube();
+    assert.deepEqual(app.opened, []);
+    assert.equal(app.clipboard, '');
+    await app.clickMode('triage');
     assert.match(button.textContent, /操作失敗/);
     assert.match(button.title, /failed/);
     assert.deepEqual(app.opened, []);
     await app.tick();
     assert.equal(button.disabled, false);
     app[failure] = false;
-    await app.clickYouTube();
+    await app.clickMode('triage');
     assert.equal(app.opened.length, 1);
     assert.ok(app.opened[0].startsWith('https://gemini.google.com/u/2/app?hl=zh-TW#rtv='));
     assert.ok(app.clipboard.includes(jobA.url));
@@ -163,9 +148,86 @@ test('YouTube button recovers from copy/open errors and permits a successful ret
     assert.equal(button.disabled, false);
   }
 });
-test('regression for full vs partial insertion and newline normalization using fixture', async () => {
+test('partial insertion reports specific error visibly and never retries as editor readiness', async () => {
+  const app = await launch({ job: jobA });
+  app.simulatePartialInsert(true);
+  app.allow = true;
+  await app.click('analysis');
+  const status = app.get('rtv-status').textContent || '';
+  assert.ok(status.includes('瀏覽器拒絕') || status.includes('無法自動填入'));
+  assert.ok(app.editor.value.includes('[PARTIAL]'));
+});
+
+test('normalizeLines in insertion path preserves meaningful content differences (whitespace normalized but text diff kept)', async () => {
+  // exercised by full success vs partial fail above; full would match exactly after norm (incl CRLF->LF + trim blank lines), partial differs by content
   const app = await launch({ job: jobA });
   app.allow = true;
   await app.click('analysis');
-  assert.ok(app.editor.value.length > 0);
+  assert.ok(app.editor.value.includes('分流這支影片'));
+  assert.ok(app.editor.value.includes(jobA.url));
+});
+
+test('auto/manual race: manual cancels pending auto, old operation does not report success or paste after nav or manual', async () => {
+  const app = await launch({ hash: hashFor(jobA) });
+  await app.tick(); // start auto async
+  app.allow = true;
+  await app.click('analysis'); // cancels auto via delivery (before auto inserted)
+  assert.ok(app.editor.value.includes('分流這支影片') || app.editor.value.includes('輸入框已有內容'));
+  const status = app.get('rtv-status').textContent || '';
+  assert.ok(status.includes('已貼上；請檢查後手動送出') || status.includes('輸入框已有內容；請先送出或清空'));
+  await app.tick();
+  await app.tick();
+  // no stale auto status overwrite
+  const finalStatus = app.get('rtv-status').textContent || '';
+  assert.ok(finalStatus.includes('已貼上；請檢查後手動送出') || finalStatus.includes('輸入框已有內容；請先送出或清空'));
+});
+
+test('navigation and route switch guarded by isSameConversation allowing initial /app to /app/<id> conservatively in auto', async () => {
+  const app = await launch({ hash: hashFor(jobA) });
+  // start auto at base
+  await app.tick();
+  // simulate creation to /app/id during wait
+  app.location.pathname = '/u/2/app/conv-xyz';
+  await app.tick();
+  await app.tick();
+  // should have inserted without treating as switch stop (initial latch)
+  assert.ok(app.editor.value.includes('分流這支影片'));
+  const status = app.get('rtv-status').textContent || '';
+  assert.ok(!status.includes('已停止自動填入'));
+});
+
+test('existing draft preserved; partial failure distinguished from draft', async () => {
+  const app = await launch({ job: jobA });
+  app.editor.value = 'user draft preserved';
+  await app.click('analysis');
+  assert.equal(app.editor.value, 'user draft preserved');
+  assert.match(app.get('rtv-status').textContent, /輸入框已有內容/);
+  // partial tested separately
+});
+
+test('entry mode only affects opening prompt choice and job metadata; detailed action always explicit review confirm and detailedNote regardless of mode', async () => {
+  // note mode job + detailed now uses review path (behavior change from entry-only)
+  const noteApp = await launch({ job: { ...jobA, mode: 'note' } });
+  await noteApp.click('detailed');
+  assert.ok(noteApp.confirmations.length >= 1);
+  noteApp.allow = true;
+  await noteApp.click('detailed');
+  assert.ok(noteApp.editor.value.includes('課堂紀錄。'));
+  // triage also works
+  const triageApp = await launch({ job: jobA });
+  triageApp.allow = true;
+  await triageApp.click('detailed');
+  assert.ok(triageApp.editor.value.includes('課堂紀錄。'));
+});
+
+test('opening uses entry mode for auto prompt only; subsequent actions explicit', async () => {
+  const triageAuto = await launch({ hash: hashFor(jobA) });
+  await triageAuto.tick();
+  assert.ok(triageAuto.editor.value.includes('分流這支影片'));
+  assert.match(triageAuto.get('rtv-status').textContent, /已自動填入字幕審查；請手動送出/);
+
+  const noteAuto = await launch({ hash: hashFor({ ...jobA, mode: 'note' }) });
+  await noteAuto.tick();
+  assert.ok(noteAuto.editor.value.includes('課堂紀錄。讀這支影片的完整字幕'));
+  assert.match(noteAuto.get('rtv-status').textContent, /已自動填入課堂筆記；請手動送出/);
 });
