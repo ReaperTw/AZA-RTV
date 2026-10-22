@@ -15,17 +15,20 @@
 1. 在 YouTube 影片頁點「用 Gemini 分析」，再選「查證」或「整理」。
 2. 查證會開啟 Gemini `/u/2/` 並自動填入字幕審查。整理會自動填入開場筆記：讀這個網址的完整字幕，不完整就停。兩種都要檢查後手動送出。
 3. 查證時，先確認字幕審查為「完整」且涵蓋全片，再根據「淘汰／深入整理」做人工決定。字幕不完整或無法取得時，先補齊字幕，不直接產生深入筆記。
-4. 在同一個 Gemini 對話展開 `RTV`。查證的分頁選「貼上深入筆記指令」；整理的分頁選「貼上開場筆記指令」。確認視窗會顯示影片標題與網址。查證必須確認目前對話已有完整字幕；整理的確認是要求現在讀片並寫筆記，不會假裝已經審查過。再手動送出。
+4. 在同一個 Gemini 對話展開 `RTV`。對話已有完整字幕時，選「貼上深入筆記指令」；已有未完成筆記時，選「貼上續寫指令」。兩者都會請你確認目前對話的內容，再由你手動送出，與最初選查證或整理無關。
 5. Gemini 會把完整 Markdown 包在 `plaintext` code block；用右上角 Copy 一次複製後貼進 Obsidian。也可用原有的 Gemini Exporter。
-6. 未完成時，點「繼續未完成筆記」並再次確認對話。續寫會要求先補完中斷的句子或章節，再往後寫；無法定位時會要求提供上一份筆記末段。
+6. 自動填入停止或需要重來時，選「重新貼上開場指令」，確認後重貼最初選擇的查證或整理指令。它不假設目前對話已讀過字幕；若輸入框有草稿，會保留草稿而不覆蓋。
+7. 筆記未完成時，選「貼上續寫指令」。續寫會要求先補完中斷的句子或章節，再往後寫；無法定位時會要求提供上一份筆記末段。
 
 ## 重要行為
 
 - 分析結果不會被重新貼回 Gemini；後續 Prompt 直接沿用同一對話的字幕資料。
-- 影片任務保存在各 Gemini 分頁的 `sessionStorage`；同一分頁重新整理仍保留，開啟其他影片不會改掉既有分頁的任務。沒有任務的分頁需從 YouTube 按鈕重新開啟，不再取用全域最後一支影片。更新前已開啟的舊 Gemini 分頁也需重新從 YouTube 開啟。
-- 深入整理與續寫每次都會要求人工確認，目前沒有自動驗證字幕或辨識對話內容。查證的分頁在切換對話後，必須先完成該影片的字幕審查。整理的分頁不要求先查證，但續寫仍要確認目前對話。複製期間切換對話時不會繼續貼上，自動填入等待期間切換對話也會停止。
+- 影片任務保存在各 Gemini 分頁的 `sessionStorage`；同一分頁重新整理仍保留，開啟其他影片不會改掉既有分頁的任務。新的網址任務會先清除舊對話關聯，只有完整貼入後才記錄這支影片使用的對話路徑。沒有任務時，面板會提示從 YouTube 按鈕開啟。
+- 自動與手動填入共用同一條流程；接受手動操作後，尚未完成的舊操作不能再貼入或回報成功。取消確認視窗不會中止原本等待中的自動填入。
+- 操作期間對話路徑一變就停止，不把 `/app` 轉成 `/app/<id>` 猜成新對話建立；停止後可人工確認並重新貼上開場指令。已關聯的影片切換對話後，需再次確認才能在新對話操作，並且只在完整貼入後更新關聯。
+- 完整字幕與對話內容仍由人確認；腳本不自動辨識 Gemini 是否已讀完影片。初次直接整理不要求先做查證，後續深入筆記與續寫則必須已有完整字幕。
 - Prompt 要求字幕不完整時暫停整理、回報缺漏，不得猜測補齊；這是給模型的規則，不是完整字幕的技術保證，仍須人工檢查回覆。
-- 輸入框已有文字時，RTV 不會覆蓋或追加，但 Prompt 仍會放在剪貼簿供手動貼上。
+- 輸入框已有文字時，RTV 不會覆蓋或追加，但 Prompt 仍會放在剪貼簿供手動替換。部分寫入時不會重試或自動清除殘文，而會要求先全選替換或清空，再按 Ctrl+V，避免把完整指令追加到殘文後面。
 - RTV 預設放在右下角、Gemini Exporter 按鈕左側；窄螢幕會調整右距及面板寬度，保留左右至少 12px 的空間。
 - YouTube 按鈕遇到複製或開啟分頁錯誤時，會顯示「操作失敗，請重試」，滑鼠提示保留錯誤原因；1.5 秒後恢復可點，不會自動重試。
 - RTV 操作使用原生按鈕：Tab／Shift+Tab 切換焦點，Enter／空白鍵啟動；不使用方向鍵選單操作。
@@ -33,6 +36,12 @@
 
 ## 開發驗證
 
-執行 `node --test tests/userscript.test.cjs`，涵蓋分頁任務隔離、重新整理保留任務、逐次對話確認、切換對話停止填入、既有草稿保護、YouTube 複製／開啟失敗後可重新操作、partial insertion error reporting、auto/manual races with cancellation、navigation with conservative /app to /app/<id> handling、normalization preserving diffs、draft vs partial distinction、entry mode only for opening (detailed always explicit review)。測試使用模擬 DOM 與瀏覽器介面，不連線 Gemini，也不驗證模型是否遵守 Prompt。
+執行 `node --test tests/userscript.test.cjs`。測試直接執行完整 userscript，使用可控制的計時器、剪貼簿延遲及 textarea／contenteditable 替身，涵蓋：
 
-測試使用 Node vm 注入完整 userscript source + mocked GM/DOM 執行 behavioral assertions，涵蓋 reload/fresh tab isolation、manual cancel-before-auto timer、actual CRLF normalization vs blank line trim、partial error stops auto、concrete route switch after initial latch、draft safety 等。未執行真實 Chromium smoke、不開任何 fixture。版本 0.5.12。
+- 在自動填入前切換對話、取消確認、接受手動操作，以及舊操作晚回來時的競爭。
+- 新任務清除舊關聯、跨分頁隔離、重新整理、確認後改綁對話，以及寫入失敗不更新關聯。
+- 查證／整理開場的手動恢復、缺少任務的錯誤提示、YouTube 開啟失敗後重試。
+- 部分寫入停止且保留殘文、使用者草稿保護、CRLF／Unicode 換行，以及內部空白行被刪除時拒絕誤報成功。
+- 富文字 DIV／P／BR 的空白行與縮排讀取，不依賴可能多算空白行的 `innerText`。
+
+另以隔離 Chromium 頁面注入完整腳本，攔截網頁請求並模擬 GM／剪貼簿；實際檢查原生富文字輸入、對話切換停止、重貼整理開場、取消後繼續自動填入、手動優先、部分寫入恢復提示與草稿保護。這些驗證不連線真實 Gemini，也不驗證模型是否遵守 Prompt。
